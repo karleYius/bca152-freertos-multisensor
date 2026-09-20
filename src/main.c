@@ -1,16 +1,27 @@
 #include <stdio.h>
+#include <stdbool.h>
+
 #include "esp_log.h"
 #include "esp_adc/adc_oneshot.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #include "dht22.h"
 
 #define DHT22_GPIO 4
 #define LDR_CHANNEL ADC_CHANNEL_6
 
+struct SensorData {
+    float temperature;
+    float humidity;
+    int lightLevel;
+    bool motionDetected;
+};
+
 adc_oneshot_unit_handle_t adc_handle;
+QueueHandle_t sensor_queue;
 
 const char *TAG = "MAIN";
 
@@ -47,6 +58,18 @@ void app_main()
         )
     );
 
+    // Create Sensor Queue
+    sensor_queue = xQueueCreate(
+        10,
+        sizeof(struct SensorData)
+    );
+
+    if (sensor_queue == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to create sensor queue");
+        return;
+    }
+
     // Start Sensor Task
     xTaskCreate(
         sensor_task,
@@ -66,6 +89,8 @@ static void sensor_task(void *pvParameters)
     float humidity;
     int light_raw;
 
+    struct SensorData sensor_data;
+
     while (1)
     {
         // Read DHT22
@@ -84,11 +109,11 @@ static void sensor_task(void *pvParameters)
                 &light_raw
             );
 
-        // Print DHT22 values
+        // Store DHT22 data
         if (dht_result == ESP_OK)
         {
-            printf("Temperature: %.2f C\n", temperature);
-            printf("Humidity: %.2f %%\n", humidity);
+            sensor_data.temperature = temperature;
+            sensor_data.humidity = humidity;
         }
         else
         {
@@ -98,17 +123,11 @@ static void sensor_task(void *pvParameters)
             );
         }
 
-        // Print LDR value
+        // Store LDR data
         if (ldr_result == ESP_OK)
         {
-            int light_percent =
+            sensor_data.lightLevel =
                 (light_raw * 100) / 4095;
-
-            printf(
-                "Light: %d%% (ADC: %d)\n",
-                light_percent,
-                light_raw
-            );
         }
         else
         {
@@ -117,6 +136,40 @@ static void sensor_task(void *pvParameters)
                 esp_err_to_name(ldr_result)
             );
         }
+
+        // Motion sensor will be implemented later
+        sensor_data.motionDetected = false;
+
+        // Send data to queue
+        if (xQueueSend(
+                sensor_queue,
+                &sensor_data,
+                0
+            ) != pdPASS)
+        {
+            printf("Failed to send sensor data to queue\n");
+        }
+
+        // Print values for testing
+        printf(
+            "Temperature: %.2f C\n",
+            sensor_data.temperature
+        );
+
+        printf(
+            "Humidity: %.2f %%\n",
+            sensor_data.humidity
+        );
+
+        printf(
+            "Light: %d%%\n",
+            sensor_data.lightLevel
+        );
+
+        printf(
+            "Motion: %s\n",
+            sensor_data.motionDetected ? "YES" : "NO"
+        );
 
         printf("----------------------\n");
 
