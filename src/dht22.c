@@ -21,6 +21,7 @@ static int wait_for_level(int gpio_num, int level, int timeout_us)
     return (int)(esp_timer_get_time() - start);
 }
 
+
 esp_err_t dht22_read(int gpio_num, float *temperature, float *humidity)
 {
     uint8_t data[5] = {0};
