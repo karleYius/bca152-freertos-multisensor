@@ -2,7 +2,26 @@
   "version": 1,
   "author": "Karle Kevin TAER",
   "editor": "wokwi",
-  "parts": [ { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 0, "left": 0, "attrs": {} } ],
-  "connections": [ [ "esp:TX", "$serialMonitor:RX", "", [] ], [ "esp:RX", "$serialMonitor:TX", "", [] ] ],
+  "parts": [
+    { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 0, "left": 139.24, "attrs": {} },
+    { "type": "wokwi-dht22", "id": "dht1", "top": -134.1, "left": 42.6, "attrs": {} },
+    {
+      "type": "wokwi-photoresistor-sensor",
+      "id": "ldr1",
+      "top": -83.2,
+      "left": 192.8,
+      "attrs": {}
+    }
+  ],
+  "connections": [
+    [ "esp:TX", "$serialMonitor:RX", "", [] ],
+    [ "esp:RX", "$serialMonitor:TX", "", [] ],
+    [ "dht1:VCC", "esp:3V3", "red", [ "v0" ] ],
+    [ "dht1:SDA", "esp:4", "green", [ "v163.2", "h19.3" ] ],
+    [ "dht1:GND", "esp:GND.1", "black", [ "v172.8", "h9.6" ] ],
+    [ "ldr1:VCC", "esp:3V3", "red", [ "h9.6", "v76.8", "h-230.4" ] ],
+    [ "ldr1:AO", "esp:34", "green", [ "h19.2", "v28.1" ] ],
+    [ "ldr1:GND", "esp:GND.2", "black", [ "h28.8", "v-0.4" ] ]
+  ],
   "dependencies": {}
 }
