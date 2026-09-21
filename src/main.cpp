@@ -1,6 +1,8 @@
 #include <stdio.h>
 
 #include "esp_log.h"
+#include "esp_err.h"
+
 #include "esp_adc/adc_oneshot.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
@@ -9,6 +11,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 
 #include "dht22.h"
 #include "ssd1306.h"
@@ -20,15 +23,20 @@
  * ========================================================= */
 
 #define DHT22_GPIO              GPIO_NUM_4
+
 #define LDR_CHANNEL             ADC_CHANNEL_6
+#define LDR_GPIO                GPIO_NUM_34
+
 #define I2C_SDA_GPIO            GPIO_NUM_21
 #define I2C_SCL_GPIO            GPIO_NUM_22
 #define OLED_I2C_ADDRESS        0x3C
 
+/* Rotary Encoder */
 #define ENCODER_CLK_GPIO        GPIO_NUM_18
 #define ENCODER_DT_GPIO         GPIO_NUM_19
 #define ENCODER_SW_GPIO         GPIO_NUM_23
 
+/* PIR Motion Sensor */
 #define PIR_GPIO                GPIO_NUM_27
 
 
@@ -36,9 +44,21 @@
  * TIMING
  * ========================================================= */
 
-static constexpr uint32_t SENSOR_INTERVAL_MS = 2000;
-static constexpr uint32_t MOTION_CHECK_INTERVAL_MS = 100;
-static constexpr uint32_t INACTIVITY_TIMEOUT_MS = 15000;
+#define SENSOR_INTERVAL_MS      2000
+#define MOTION_CHECK_INTERVAL_MS 100
+#define ENCODER_CHECK_INTERVAL_MS 5
+
+/* Laboratory testing timeout */
+#define INACTIVITY_TIMEOUT_MS   15000
+
+
+/* =========================================================
+ * PART X — EVENT GROUP BITS
+ * ========================================================= */
+
+#define EVENT_ACTIVE    BIT0
+#define EVENT_MOTION    BIT1
+#define EVENT_ALARM     BIT2
 
 
 /* =========================================================
@@ -79,43 +99,36 @@ struct SensorData
 
 
 /* =========================================================
- * EVENT GROUP
- *
- * STATE_ACTIVE_BIT is set when the system is ACTIVE.
- * When the bit is cleared, the system is INACTIVE.
- * ========================================================= */
-
-#define STATE_ACTIVE_BIT    BIT0
-
-
-/* =========================================================
  * GLOBAL VARIABLES
  * ========================================================= */
 
 static const char *TAG = "MAIN";
 
-adc_oneshot_unit_handle_t adc_handle;
+/* ADC */
+static adc_oneshot_unit_handle_t adc_handle = NULL;
 
-QueueHandle_t sensor_queue;
+/* I2C */
+static i2c_master_bus_handle_t i2c_bus_handle = NULL;
 
-i2c_master_bus_handle_t i2c_bus_handle;
+/* Sensor queue */
+static QueueHandle_t sensor_queue = NULL;
 
-EventGroupHandle_t system_state_event_group;
+/* PART X Event Group */
+static EventGroupHandle_t system_event_group = NULL;
+
+/* Mutex for shared state */
+static SemaphoreHandle_t state_mutex = NULL;
 
 /* Current OLED page */
-static volatile DisplayMode currentMode =
+static DisplayMode currentMode =
     DisplayMode::TEMPERATURE;
 
-/* Current system state */
-static volatile SystemState systemState =
+/* ACTIVE / INACTIVE state */
+static SystemState systemState =
     SystemState::ACTIVE;
 
-/* Current PIR state */
-static volatile bool motionDetected =
-    false;
-
-/* Time when the last motion was detected */
-static TickType_t lastMotionTime = 0;
+/* Latest motion state */
+static bool motionDetected = false;
 
 
 /* =========================================================
@@ -130,25 +143,11 @@ static void display_task(void *pvParameters);
 
 static void motion_task(void *pvParameters);
 
-static const char *displayModeName(DisplayMode mode);
+static const char *displayModeName(
+    DisplayMode mode
+);
 
-
-/* =========================================================
- * HELPER: CHECK ACTIVE STATE
- * ========================================================= */
-
-static bool isSystemActive()
-{
-    if (system_state_event_group == NULL)
-    {
-        return systemState == SystemState::ACTIVE;
-    }
-
-    EventBits_t bits =
-        xEventGroupGetBits(system_state_event_group);
-
-    return (bits & STATE_ACTIVE_BIT) != 0;
-}
+static bool isSystemActive(void);
 
 
 /* =========================================================
@@ -157,8 +156,15 @@ static bool isSystemActive()
 
 extern "C" void app_main()
 {
-    ESP_LOGI(TAG, "BCA152 FreeRTOS Multisensor");
-    ESP_LOGI(TAG, "System Starting...");
+    ESP_LOGI(
+        TAG,
+        "BCA152 FreeRTOS Multisensor"
+    );
+
+    ESP_LOGI(
+        TAG,
+        "System Starting..."
+    );
 
 
     /* =====================================================
@@ -195,7 +201,10 @@ extern "C" void app_main()
     );
 
 
-    ESP_LOGI(TAG, "ADC configured");
+    ESP_LOGI(
+        TAG,
+        "ADC configured"
+    );
 
 
     /* =====================================================
@@ -231,7 +240,10 @@ extern "C" void app_main()
     );
 
 
-    ESP_LOGI(TAG, "I2C bus configured");
+    ESP_LOGI(
+        TAG,
+        "I2C bus configured"
+    );
 
 
     /* =====================================================
@@ -246,7 +258,10 @@ extern "C" void app_main()
     );
 
 
-    ESP_LOGI(TAG, "OLED initialized");
+    ESP_LOGI(
+        TAG,
+        "OLED initialized"
+    );
 
 
     /* =====================================================
@@ -274,11 +289,16 @@ extern "C" void app_main()
 
 
     ESP_ERROR_CHECK(
-        gpio_config(&encoder_config)
+        gpio_config(
+            &encoder_config
+        )
     );
 
 
-    ESP_LOGI(TAG, "Rotary encoder configured");
+    ESP_LOGI(
+        TAG,
+        "Rotary encoder configured"
+    );
 
 
     /* =====================================================
@@ -304,55 +324,15 @@ extern "C" void app_main()
 
 
     ESP_ERROR_CHECK(
-        gpio_config(&pir_config)
+        gpio_config(
+            &pir_config
+        )
     );
 
 
     ESP_LOGI(
         TAG,
-        "PIR motion sensor configured on GPIO %d",
-        PIR_GPIO
-    );
-
-
-    /* =====================================================
-     * CREATE SYSTEM STATE EVENT GROUP
-     * ===================================================== */
-
-    system_state_event_group =
-        xEventGroupCreate();
-
-
-    if (system_state_event_group == NULL)
-    {
-        ESP_LOGE(
-            TAG,
-            "Failed to create system state event group"
-        );
-
-        return;
-    }
-
-
-    /* =====================================================
-     * INITIAL STATE = ACTIVE
-     * ===================================================== */
-
-    systemState =
-        SystemState::ACTIVE;
-
-    xEventGroupSetBits(
-        system_state_event_group,
-        STATE_ACTIVE_BIT
-    );
-
-    lastMotionTime =
-        xTaskGetTickCount();
-
-
-    ESP_LOGI(
-        TAG,
-        "Initial system state: ACTIVE"
+        "PIR motion sensor configured"
     );
 
 
@@ -380,6 +360,73 @@ extern "C" void app_main()
     ESP_LOGI(
         TAG,
         "Sensor queue created"
+    );
+
+
+    /* =====================================================
+     * CREATE EVENT GROUP
+     *
+     * PART X
+     *
+     * EVENT_ACTIVE
+     * EVENT_MOTION
+     * EVENT_ALARM
+     * ===================================================== */
+
+    system_event_group =
+        xEventGroupCreate();
+
+
+    if (system_event_group == NULL)
+    {
+        ESP_LOGE(
+            TAG,
+            "Failed to create event group"
+        );
+
+        return;
+    }
+
+
+    /*
+     * System starts in ACTIVE state.
+     *
+     * EVENT_ACTIVE is therefore SET.
+     */
+    xEventGroupSetBits(
+        system_event_group,
+        EVENT_ACTIVE
+    );
+
+
+    ESP_LOGI(
+        TAG,
+        "Event group created"
+    );
+
+
+    /* =====================================================
+     * CREATE STATE MUTEX
+     * ===================================================== */
+
+    state_mutex =
+        xSemaphoreCreateMutex();
+
+
+    if (state_mutex == NULL)
+    {
+        ESP_LOGE(
+            TAG,
+            "Failed to create state mutex"
+        );
+
+        return;
+    }
+
+
+    ESP_LOGI(
+        TAG,
+        "State mutex created"
     );
 
 
@@ -497,17 +544,22 @@ extern "C" void app_main()
 /* =========================================================
  * SENSOR TASK
  *
- * Reads:
- * - DHT22
- * - LDR
- *
- * Sends SensorData through the FreeRTOS queue.
- *
- * Uses vTaskDelayUntil() for periodic execution.
+ * Responsibilities:
+ * - Read DHT22
+ * - Read LDR
+ * - Evaluate temperature alarm
+ * - Send SensorData to queue
+ * - Signal EVENT_ALARM
+ * - Run periodically using vTaskDelayUntil()
  * ========================================================= */
 
-static void sensor_task(void *pvParameters)
+static void sensor_task(
+    void *pvParameters
+)
 {
+    (void)pvParameters;
+
+
     TickType_t lastWakeTime =
         xTaskGetTickCount();
 
@@ -529,23 +581,6 @@ static void sensor_task(void *pvParameters)
 
     while (1)
     {
-        /* =================================================
-         * INACTIVE STATE
-         *
-         * Reduce unnecessary sensor processing.
-         * MotionTask continues running separately.
-         * ================================================= */
-
-        if (!isSystemActive())
-        {
-            vTaskDelay(
-                pdMS_TO_TICKS(200)
-            );
-
-            continue;
-        }
-
-
         /* =================================================
          * READ DHT22
          * ================================================= */
@@ -570,7 +605,9 @@ static void sensor_task(void *pvParameters)
         {
             printf(
                 "DHT22 read failed: %s\n",
-                esp_err_to_name(dht_result)
+                esp_err_to_name(
+                    dht_result
+                )
             );
         }
 
@@ -589,6 +626,10 @@ static void sensor_task(void *pvParameters)
 
         if (ldr_result == ESP_OK)
         {
+            /*
+             * Convert raw ADC value to
+             * approximate percentage.
+             */
             sensor_data.lightLevel =
                 (light_raw * 100) / 4095;
         }
@@ -596,23 +637,35 @@ static void sensor_task(void *pvParameters)
         {
             printf(
                 "LDR read failed: %s\n",
-                esp_err_to_name(ldr_result)
+                esp_err_to_name(
+                    ldr_result
+                )
             );
         }
 
 
         /* =================================================
-         * GET CURRENT MOTION STATUS
+         * GET CURRENT MOTION STATE
          * ================================================= */
 
-        sensor_data.motionDetected =
-            motionDetected;
+        if (
+            xSemaphoreTake(
+                state_mutex,
+                pdMS_TO_TICKS(10)
+            ) == pdTRUE
+        )
+        {
+            sensor_data.motionDetected =
+                motionDetected;
+
+            xSemaphoreGive(
+                state_mutex
+            );
+        }
 
 
         /* =================================================
          * EVALUATE TEMPERATURE ALARM
-         *
-         * Alarm is active while the system is ACTIVE.
          * ================================================= */
 
         AlarmState alarmState =
@@ -620,6 +673,35 @@ static void sensor_task(void *pvParameters)
                 sensor_data.temperature
             );
 
+
+        /* =================================================
+         * PART X — SIGNAL ALARM EVENT
+         * ================================================= */
+
+        if (
+            alarmState ==
+                AlarmState::LOW_TEMPERATURE ||
+            alarmState ==
+                AlarmState::HIGH_TEMPERATURE
+        )
+        {
+            xEventGroupSetBits(
+                system_event_group,
+                EVENT_ALARM
+            );
+        }
+        else
+        {
+            xEventGroupClearBits(
+                system_event_group,
+                EVENT_ALARM
+            );
+        }
+
+
+        /* =================================================
+         * PRINT ALARM STATE
+         * ================================================= */
 
         switch (alarmState)
         {
@@ -652,7 +734,7 @@ static void sensor_task(void *pvParameters)
 
 
         /* =================================================
-         * SEND DATA TO QUEUE
+         * SEND DATA TO SENSOR QUEUE
          * ================================================= */
 
         if (
@@ -670,7 +752,7 @@ static void sensor_task(void *pvParameters)
 
 
         /* =================================================
-         * PRINT VALUES
+         * SERIAL OUTPUT
          * ================================================= */
 
         printf(
@@ -699,11 +781,29 @@ static void sensor_task(void *pvParameters)
         );
 
 
+        /* =================================================
+         * SHOW CURRENT EVENT BITS
+         * ================================================= */
+
+        EventBits_t eventBits =
+            xEventGroupGetBits(
+                system_event_group
+            );
+
+
         printf(
-            "System State: %s\n",
-            isSystemActive()
-                ? "ACTIVE"
-                : "INACTIVE"
+            "Events: ACTIVE=%s MOTION=%s ALARM=%s\n",
+            (eventBits & EVENT_ACTIVE)
+                ? "SET"
+                : "CLEAR",
+
+            (eventBits & EVENT_MOTION)
+                ? "SET"
+                : "CLEAR",
+
+            (eventBits & EVENT_ALARM)
+                ? "SET"
+                : "CLEAR"
         );
 
 
@@ -713,7 +813,7 @@ static void sensor_task(void *pvParameters)
 
 
         /* =================================================
-         * RUN EVERY 2 SECONDS
+         * PERIODIC EXECUTION
          * ================================================= */
 
         vTaskDelayUntil(
@@ -729,38 +829,31 @@ static void sensor_task(void *pvParameters)
 /* =========================================================
  * MOTION TASK
  *
- * PIR:
- *     GPIO 27
- *
- * ACTIVE:
- *     - Normal sensor processing
- *     - OLED enabled
- *     - Encoder active
- *     - Alarm active
- *
- * INACTIVE:
- *     - OLED blank
- *     - Sensor processing reduced
- *     - Encoder ignored
- *     - Motion detection continues
- *
- * 15 seconds without motion:
- *     ACTIVE -> INACTIVE
- *
- * Motion while inactive:
- *     INACTIVE -> ACTIVE
+ * Responsibilities:
+ * - Monitor PIR
+ * - Produce EVENT_MOTION
+ * - Maintain ACTIVE / INACTIVE state
+ * - Produce/clear EVENT_ACTIVE
+ * - Restore ACTIVE when motion is detected
  * ========================================================= */
 
-static void motion_task(void *pvParameters)
+static void motion_task(
+    void *pvParameters
+)
 {
-    lastMotionTime =
+    (void)pvParameters;
+
+
+    TickType_t lastMotionTime =
         xTaskGetTickCount();
 
 
     while (1)
     {
         int pirLevel =
-            gpio_get_level(PIR_GPIO);
+            gpio_get_level(
+                PIR_GPIO
+            );
 
 
         TickType_t now =
@@ -773,27 +866,69 @@ static void motion_task(void *pvParameters)
 
         if (pirLevel == 1)
         {
-            motionDetected = true;
-
             lastMotionTime = now;
 
 
-            /* =============================================
-             * INACTIVE -> ACTIVE
-             * ============================================= */
+            /* ---------------------------------------------
+             * Update shared motion state
+             * --------------------------------------------- */
 
             if (
-                systemState ==
-                SystemState::INACTIVE
+                xSemaphoreTake(
+                    state_mutex,
+                    pdMS_TO_TICKS(10)
+                ) == pdTRUE
             )
             {
-                systemState =
-                    SystemState::ACTIVE;
+                motionDetected = true;
+
+                xSemaphoreGive(
+                    state_mutex
+                );
+            }
 
 
+            /* ---------------------------------------------
+             * PART X — SIGNAL MOTION EVENT
+             * --------------------------------------------- */
+
+            xEventGroupSetBits(
+                system_event_group,
+                EVENT_MOTION
+            );
+
+
+            /* ---------------------------------------------
+             * INACTIVE -> ACTIVE
+             * --------------------------------------------- */
+
+            if (
+                !isSystemActive()
+            )
+            {
+                if (
+                    xSemaphoreTake(
+                        state_mutex,
+                        pdMS_TO_TICKS(10)
+                    ) == pdTRUE
+                )
+                {
+                    systemState =
+                        SystemState::ACTIVE;
+
+                    xSemaphoreGive(
+                        state_mutex
+                    );
+                }
+
+
+                /*
+                 * EVENT_ACTIVE represents the
+                 * current system state.
+                 */
                 xEventGroupSetBits(
-                    system_state_event_group,
-                    STATE_ACTIVE_BIT
+                    system_event_group,
+                    EVENT_ACTIVE
                 );
 
 
@@ -801,54 +936,98 @@ static void motion_task(void *pvParameters)
                     "STATE: INACTIVE -> ACTIVE "
                     "(motion detected)\n"
                 );
+
+
+                printf(
+                    "DISPLAY: ON "
+                    "(system active)\n"
+                );
             }
         }
         else
         {
-            motionDetected = false;
-
-
-            /* =============================================
-             * ACTIVE -> INACTIVE AFTER 15 SECONDS
-             * ============================================= */
+            /* =================================================
+             * NO CURRENT PIR SIGNAL
+             * ================================================= */
 
             if (
-                systemState ==
-                SystemState::ACTIVE
+                xSemaphoreTake(
+                    state_mutex,
+                    pdMS_TO_TICKS(10)
+                ) == pdTRUE
             )
             {
-                TickType_t elapsed =
-                    now - lastMotionTime;
+                motionDetected = false;
 
-
-                if (
-                    elapsed >=
-                    pdMS_TO_TICKS(
-                        INACTIVITY_TIMEOUT_MS
-                    )
-                )
-                {
-                    systemState =
-                        SystemState::INACTIVE;
-
-
-                    xEventGroupClearBits(
-                        system_state_event_group,
-                        STATE_ACTIVE_BIT
-                    );
-
-
-                    printf(
-                        "STATE: ACTIVE -> INACTIVE "
-                        "(15s inactivity)\n"
-                    );
-                }
+                xSemaphoreGive(
+                    state_mutex
+                );
             }
         }
 
 
         /* =================================================
-         * CHECK PIR EVERY 100 ms
+         * ACTIVE -> INACTIVE
+         *
+         * If no motion occurs for 15 seconds.
+         * ================================================= */
+
+        if (
+            isSystemActive()
+        )
+        {
+            TickType_t elapsed =
+                now - lastMotionTime;
+
+
+            if (
+                elapsed >=
+                pdMS_TO_TICKS(
+                    INACTIVITY_TIMEOUT_MS
+                )
+            )
+            {
+                if (
+                    xSemaphoreTake(
+                        state_mutex,
+                        pdMS_TO_TICKS(10)
+                    ) == pdTRUE
+                )
+                {
+                    systemState =
+                        SystemState::INACTIVE;
+
+                    xSemaphoreGive(
+                        state_mutex
+                    );
+                }
+
+
+                /*
+                 * Clear ACTIVE event bit.
+                 */
+                xEventGroupClearBits(
+                    system_event_group,
+                    EVENT_ACTIVE
+                );
+
+
+                printf(
+                    "STATE: ACTIVE -> INACTIVE "
+                    "(15s inactivity)\n"
+                );
+
+
+                printf(
+                    "DISPLAY: OFF "
+                    "(system inactive)\n"
+                );
+            }
+        }
+
+
+        /* =================================================
+         * MOTION TASK DELAY
          * ================================================= */
 
         vTaskDelay(
@@ -893,8 +1072,13 @@ static void motion_task(void *pvParameters)
  * Encoder is active only while the system is ACTIVE.
  * ========================================================= */
 
-static void input_task(void *pvParameters)
+static void input_task(
+    void *pvParameters
+)
 {
+    (void)pvParameters;
+
+
     int previousCLK =
         gpio_get_level(
             ENCODER_CLK_GPIO
@@ -907,15 +1091,17 @@ static void input_task(void *pvParameters)
     while (1)
     {
         /* =================================================
-         * INACTIVE STATE
-         *
-         * Ignore encoder input.
+         * ENCODER DISABLED WHILE INACTIVE
          * ================================================= */
 
-        if (!isSystemActive())
+        if (
+            !isSystemActive()
+        )
         {
             vTaskDelay(
-                pdMS_TO_TICKS(50)
+                pdMS_TO_TICKS(
+                    ENCODER_CHECK_INTERVAL_MS
+                )
             );
 
             continue;
@@ -943,9 +1129,9 @@ static void input_task(void *pvParameters)
                 xTaskGetTickCount();
 
 
-            /* =============================================
+            /* =================================================
              * DEBOUNCE
-             * ============================================= */
+             * ================================================= */
 
             if (
                 (now - lastRotationTime) >=
@@ -958,103 +1144,129 @@ static void input_task(void *pvParameters)
                     );
 
 
-                /* =========================================
+                /* =================================================
                  * CLOCKWISE
-                 * ========================================= */
+                 * ================================================= */
 
                 if (dt == 1)
                 {
-                    switch (currentMode)
+                    if (
+                        xSemaphoreTake(
+                            state_mutex,
+                            pdMS_TO_TICKS(10)
+                        ) == pdTRUE
+                    )
                     {
-                        case DisplayMode::TEMPERATURE:
+                        switch (currentMode)
+                        {
+                            case DisplayMode::TEMPERATURE:
 
-                            currentMode =
-                                DisplayMode::HUMIDITY;
+                                currentMode =
+                                    DisplayMode::HUMIDITY;
 
-                            break;
-
-
-                        case DisplayMode::HUMIDITY:
-
-                            currentMode =
-                                DisplayMode::LIGHT;
-
-                            break;
+                                break;
 
 
-                        case DisplayMode::LIGHT:
+                            case DisplayMode::HUMIDITY:
 
-                            currentMode =
-                                DisplayMode::MOTION;
+                                currentMode =
+                                    DisplayMode::LIGHT;
 
-                            break;
+                                break;
 
 
-                        case DisplayMode::MOTION:
+                            case DisplayMode::LIGHT:
 
-                            currentMode =
-                                DisplayMode::TEMPERATURE;
+                                currentMode =
+                                    DisplayMode::MOTION;
 
-                            break;
+                                break;
+
+
+                            case DisplayMode::MOTION:
+
+                                currentMode =
+                                    DisplayMode::TEMPERATURE;
+
+                                break;
+                        }
+
+
+                        printf(
+                            "Encoder: CLOCKWISE -> %s\n",
+                            displayModeName(
+                                currentMode
+                            )
+                        );
+
+
+                        xSemaphoreGive(
+                            state_mutex
+                        );
                     }
-
-
-                    printf(
-                        "Encoder: CLOCKWISE -> %s\n",
-                        displayModeName(
-                            currentMode
-                        )
-                    );
                 }
 
 
-                /* =========================================
+                /* =================================================
                  * COUNTERCLOCKWISE
-                 * ========================================= */
+                 * ================================================= */
 
                 else
                 {
-                    switch (currentMode)
+                    if (
+                        xSemaphoreTake(
+                            state_mutex,
+                            pdMS_TO_TICKS(10)
+                        ) == pdTRUE
+                    )
                     {
-                        case DisplayMode::TEMPERATURE:
+                        switch (currentMode)
+                        {
+                            case DisplayMode::TEMPERATURE:
 
-                            currentMode =
-                                DisplayMode::MOTION;
+                                currentMode =
+                                    DisplayMode::MOTION;
 
-                            break;
-
-
-                        case DisplayMode::HUMIDITY:
-
-                            currentMode =
-                                DisplayMode::TEMPERATURE;
-
-                            break;
+                                break;
 
 
-                        case DisplayMode::LIGHT:
+                            case DisplayMode::HUMIDITY:
 
-                            currentMode =
-                                DisplayMode::HUMIDITY;
+                                currentMode =
+                                    DisplayMode::TEMPERATURE;
 
-                            break;
+                                break;
 
 
-                        case DisplayMode::MOTION:
+                            case DisplayMode::LIGHT:
 
-                            currentMode =
-                                DisplayMode::LIGHT;
+                                currentMode =
+                                    DisplayMode::HUMIDITY;
 
-                            break;
+                                break;
+
+
+                            case DisplayMode::MOTION:
+
+                                currentMode =
+                                    DisplayMode::LIGHT;
+
+                                break;
+                        }
+
+
+                        printf(
+                            "Encoder: COUNTERCLOCKWISE -> %s\n",
+                            displayModeName(
+                                currentMode
+                            )
+                        );
+
+
+                        xSemaphoreGive(
+                            state_mutex
+                        );
                     }
-
-
-                    printf(
-                        "Encoder: COUNTERCLOCKWISE -> %s\n",
-                        displayModeName(
-                            currentMode
-                        )
-                    );
                 }
 
 
@@ -1071,7 +1283,9 @@ static void input_task(void *pvParameters)
          * ================================================= */
 
         vTaskDelay(
-            pdMS_TO_TICKS(5)
+            pdMS_TO_TICKS(
+                ENCODER_CHECK_INTERVAL_MS
+            )
         );
     }
 }
@@ -1080,16 +1294,20 @@ static void input_task(void *pvParameters)
 /* =========================================================
  * DISPLAY TASK
  *
- * ACTIVE:
- *     OLED displays sensor information.
- *
- * INACTIVE:
- *     OLED is cleared/blanked.
- *     No unnecessary OLED operations are performed.
+ * Responsibilities:
+ * - Own the OLED
+ * - Consume SensorData queue
+ * - Consume/observe Event Group
+ * - Turn display off while INACTIVE
  * ========================================================= */
 
-static void display_task(void *pvParameters)
+static void display_task(
+    void *pvParameters
+)
 {
+    (void)pvParameters;
+
+
     SensorData sensor_data =
     {
         0.0f,
@@ -1099,30 +1317,42 @@ static void display_task(void *pvParameters)
     };
 
 
-    bool displayIsBlank =
-        false;
+    bool displayWasActive = true;
+
+    bool previousAlarmState = false;
 
 
     while (1)
     {
         /* =================================================
-         * INACTIVE STATE
+         * CHECK SYSTEM STATE
          * ================================================= */
 
-        if (!isSystemActive())
-        {
-            if (!displayIsBlank)
-            {
-                /* =========================================
-                 * CLEAR OLED ONCE
-                 * ========================================= */
+        bool active =
+            isSystemActive();
 
+
+        /* =================================================
+         * INACTIVE BEHAVIOR
+         *
+         * OLED blank
+         * Display operations reduced
+         * MotionTask continues running
+         * ================================================= */
+
+        if (!active)
+        {
+            if (displayWasActive)
+            {
+                /*
+                 * Clear the OLED once when entering
+                 * INACTIVE.
+                 */
                 ssd1306_clear();
 
                 ssd1306_update();
 
-
-                displayIsBlank = true;
+                displayWasActive = false;
 
 
                 printf(
@@ -1132,13 +1362,8 @@ static void display_task(void *pvParameters)
             }
 
 
-            /* =============================================
-             * Do not repeatedly update OLED.
-             * MotionTask remains active.
-             * ============================================= */
-
             vTaskDelay(
-                pdMS_TO_TICKS(200)
+                pdMS_TO_TICKS(500)
             );
 
             continue;
@@ -1146,13 +1371,12 @@ static void display_task(void *pvParameters)
 
 
         /* =================================================
-         * ACTIVE STATE
+         * SYSTEM IS ACTIVE
          * ================================================= */
 
-        if (displayIsBlank)
+        if (!displayWasActive)
         {
-            displayIsBlank = false;
-
+            displayWasActive = true;
 
             printf(
                 "DISPLAY: ON "
@@ -1163,32 +1387,108 @@ static void display_task(void *pvParameters)
 
         /* =================================================
          * WAIT FOR SENSOR DATA
-         *
-         * Short timeout allows us to notice state changes.
          * ================================================= */
 
         if (
             xQueueReceive(
                 sensor_queue,
                 &sensor_data,
-                pdMS_TO_TICKS(200)
+                pdMS_TO_TICKS(2500)
             ) == pdPASS
         )
         {
-            char line2[32];
-            char line3[32];
+            /* =================================================
+             * READ EVENT GROUP
+             * ================================================= */
+
+            EventBits_t eventBits =
+                xEventGroupGetBits(
+                    system_event_group
+                );
 
 
-            /* =============================================
-             * CLEAR OLED
-             * ============================================= */
+            /* =================================================
+             * EVENT_ACTIVE
+             *
+             * This is a state bit.
+             * Do NOT clear it here.
+             *
+             * MotionTask owns this bit.
+             * ================================================= */
+
+            bool activeEvent =
+                (eventBits & EVENT_ACTIVE) != 0;
+
+
+            /* =================================================
+             * EVENT_MOTION
+             *
+             * This is a transient event.
+             * DisplayTask consumes and clears it.
+             * ================================================= */
+
+            if (
+                eventBits & EVENT_MOTION
+            )
+            {
+                printf(
+                    "EVENT: MOTION DETECTED\n"
+                );
+
+
+                xEventGroupClearBits(
+                    system_event_group,
+                    EVENT_MOTION
+                );
+            }
+
+
+            /* =================================================
+             * EVENT_ALARM
+             *
+             * This is a state/event bit.
+             * SensorTask owns it.
+             * DisplayTask only observes it.
+             * ================================================= */
+
+            bool alarmEvent =
+                (eventBits & EVENT_ALARM) != 0;
+
+
+            if (
+                alarmEvent !=
+                previousAlarmState
+            )
+            {
+                if (alarmEvent)
+                {
+                    printf(
+                        "EVENT: ALARM ACTIVE\n"
+                    );
+                }
+                else
+                {
+                    printf(
+                        "EVENT: ALARM CLEARED\n"
+                    );
+                }
+
+
+                previousAlarmState =
+                    alarmEvent;
+            }
+
+
+            /* =================================================
+             * DISPLAY
+             * ================================================= */
 
             ssd1306_clear();
 
 
-            /* =============================================
+            /* =================================================
              * HEADER
-             * ============================================= */
+             * ================================================= */
 
             ssd1306_set_cursor(
                 0,
@@ -1200,15 +1500,19 @@ static void display_task(void *pvParameters)
             );
 
 
-            /* =============================================
+            /* =================================================
              * DISPLAY SELECTED PAGE
-             * ============================================= */
+             * ================================================= */
+
+            char line2[32];
+            char line3[32];
+
 
             switch (currentMode)
             {
-                /* -----------------------------------------
+                /* =================================================
                  * TEMPERATURE
-                 * ----------------------------------------- */
+                 * ================================================= */
 
                 case DisplayMode::TEMPERATURE:
 
@@ -1249,9 +1553,9 @@ static void display_task(void *pvParameters)
                     break;
 
 
-                /* -----------------------------------------
+                /* =================================================
                  * HUMIDITY
-                 * ----------------------------------------- */
+                 * ================================================= */
 
                 case DisplayMode::HUMIDITY:
 
@@ -1292,9 +1596,9 @@ static void display_task(void *pvParameters)
                     break;
 
 
-                /* -----------------------------------------
+                /* =================================================
                  * LIGHT
-                 * ----------------------------------------- */
+                 * ================================================= */
 
                 case DisplayMode::LIGHT:
 
@@ -1335,9 +1639,9 @@ static void display_task(void *pvParameters)
                     break;
 
 
-                /* -----------------------------------------
+                /* =================================================
                  * MOTION
-                 * ----------------------------------------- */
+                 * ================================================= */
 
                 case DisplayMode::MOTION:
 
@@ -1381,9 +1685,9 @@ static void display_task(void *pvParameters)
             }
 
 
-            /* =============================================
+            /* =================================================
              * UPDATE OLED
-             * ============================================= */
+             * ================================================= */
 
             esp_err_t result =
                 ssd1306_update();
@@ -1394,11 +1698,49 @@ static void display_task(void *pvParameters)
                 ESP_LOGE(
                     TAG,
                     "OLED update failed: %s",
-                    esp_err_to_name(result)
+                    esp_err_to_name(
+                        result
+                    )
                 );
             }
+
+
+            /*
+             * activeEvent is intentionally read so that
+             * EVENT_ACTIVE is a meaningful consumed/observed
+             * system-state signal.
+             */
+            (void)activeEvent;
         }
     }
+}
+
+
+/* =========================================================
+ * CHECK SYSTEM STATE
+ *
+ * EVENT_ACTIVE is the authoritative event-group state bit.
+ * ========================================================= */
+
+static bool isSystemActive(void)
+{
+    if (
+        system_event_group == NULL
+    )
+    {
+        return true;
+    }
+
+
+    EventBits_t bits =
+        xEventGroupGetBits(
+            system_event_group
+        );
+
+
+    return (
+        (bits & EVENT_ACTIVE) != 0
+    );
 }
 
 
@@ -1413,27 +1755,22 @@ static const char *displayModeName(
     switch (mode)
     {
         case DisplayMode::TEMPERATURE:
-
             return "TEMPERATURE";
 
 
         case DisplayMode::HUMIDITY:
-
             return "HUMIDITY";
 
 
         case DisplayMode::LIGHT:
-
             return "LIGHT";
 
 
         case DisplayMode::MOTION:
-
             return "MOTION";
 
 
         default:
-
             return "UNKNOWN";
     }
 }
