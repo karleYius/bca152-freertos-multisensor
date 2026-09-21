@@ -1,5 +1,4 @@
 #include <stdio.h>
-#include <stdbool.h>
 
 #include "esp_log.h"
 #include "esp_adc/adc_oneshot.h"
@@ -9,51 +8,46 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
-#include "freertos/semphr.h"
 
 #include "dht22.h"
 #include "ssd1306.h"
+#include "alarm_logic.h"
 
 
-// ======================================================
-// HARDWARE CONFIGURATION
-// ======================================================
+/* =========================================================
+ * GPIO / HARDWARE CONFIGURATION
+ * ========================================================= */
 
-// DHT22
-#define DHT22_GPIO 4
+#define DHT22_GPIO              GPIO_NUM_4
 
-// LDR
-// ADC1 Channel 6 = GPIO34 on classic ESP32
-#define LDR_CHANNEL ADC_CHANNEL_6
+#define LDR_CHANNEL             ADC_CHANNEL_6
 
-// OLED
-#define I2C_SDA_GPIO 21
-#define I2C_SCL_GPIO 22
-#define OLED_I2C_ADDRESS 0x3C
+#define I2C_SDA_GPIO            GPIO_NUM_21
+#define I2C_SCL_GPIO            GPIO_NUM_22
+#define OLED_I2C_ADDRESS        0x3C
 
-// Rotary Encoder
-#define ENCODER_CLK_GPIO 18
-#define ENCODER_DT_GPIO  19
-#define ENCODER_SW_GPIO  23
+/* Rotary Encoder */
+#define ENCODER_CLK_GPIO        GPIO_NUM_18
+#define ENCODER_DT_GPIO         GPIO_NUM_19
+#define ENCODER_SW_GPIO         GPIO_NUM_23
 
 
-// ======================================================
-// DISPLAY MODES
-// ======================================================
+/* =========================================================
+ * DISPLAY MODES
+ * ========================================================= */
 
-typedef enum
+enum class DisplayMode
 {
-    DISPLAY_TEMPERATURE,
-    DISPLAY_HUMIDITY,
-    DISPLAY_LIGHT,
-    DISPLAY_MOTION
+    TEMPERATURE,
+    HUMIDITY,
+    LIGHT,
+    MOTION
+};
 
-} DisplayMode;
 
-
-// ======================================================
-// SENSOR DATA
-// ======================================================
+/* =========================================================
+ * SENSOR DATA
+ * ========================================================= */
 
 struct SensorData
 {
@@ -64,162 +58,40 @@ struct SensorData
 };
 
 
-// ======================================================
-// GLOBAL HANDLES
-// ======================================================
-
-adc_oneshot_unit_handle_t adc_handle;
-
-i2c_master_bus_handle_t i2c_bus_handle;
-
-QueueHandle_t sensor_queue;
-
-SemaphoreHandle_t display_mode_mutex;
-
-
-// ======================================================
-// CURRENT DISPLAY MODE
-// ======================================================
-
-static DisplayMode current_display_mode =
-    DISPLAY_TEMPERATURE;
-
-
-// ======================================================
-// LOG TAG
-// ======================================================
+/* =========================================================
+ * GLOBAL VARIABLES
+ * ========================================================= */
 
 static const char *TAG = "MAIN";
 
+static adc_oneshot_unit_handle_t adc_handle;
 
-// ======================================================
-// TASK DECLARATIONS
-// ======================================================
+static QueueHandle_t sensor_queue;
+
+static i2c_master_bus_handle_t i2c_bus_handle;
+
+static DisplayMode currentMode =
+    DisplayMode::TEMPERATURE;
+
+
+/* =========================================================
+ * FUNCTION DECLARATIONS
+ * ========================================================= */
 
 static void sensor_task(void *pvParameters);
 
-static void display_task(void *pvParameters);
-
 static void input_task(void *pvParameters);
 
+static void display_task(void *pvParameters);
 
-// ======================================================
-// DISPLAY MODE HELPER
-// ======================================================
-
-static DisplayMode get_display_mode(void)
-{
-    DisplayMode mode;
-
-    /*
-     * Protect access to current_display_mode.
-     *
-     * InputTask changes it.
-     * DisplayTask reads it.
-     */
-    if (
-        xSemaphoreTake(
-            display_mode_mutex,
-            portMAX_DELAY
-        ) == pdTRUE
-    )
-    {
-        mode = current_display_mode;
-
-        xSemaphoreGive(
-            display_mode_mutex
-        );
-    }
-    else
-    {
-        mode = DISPLAY_TEMPERATURE;
-    }
-
-    return mode;
-}
+static const char *displayModeName(DisplayMode mode);
 
 
-// ======================================================
-// NEXT DISPLAY MODE
-// ======================================================
+/* =========================================================
+ * APP MAIN
+ * ========================================================= */
 
-static DisplayMode next_display_mode(
-    DisplayMode mode
-)
-{
-    switch (mode)
-    {
-        case DISPLAY_TEMPERATURE:
-            return DISPLAY_HUMIDITY;
-
-        case DISPLAY_HUMIDITY:
-            return DISPLAY_LIGHT;
-
-        case DISPLAY_LIGHT:
-            return DISPLAY_MOTION;
-
-        case DISPLAY_MOTION:
-        default:
-            return DISPLAY_TEMPERATURE;
-    }
-}
-
-
-// ======================================================
-// PREVIOUS DISPLAY MODE
-// ======================================================
-
-static DisplayMode previous_display_mode(
-    DisplayMode mode
-)
-{
-    switch (mode)
-    {
-        case DISPLAY_TEMPERATURE:
-            return DISPLAY_MOTION;
-
-        case DISPLAY_HUMIDITY:
-            return DISPLAY_TEMPERATURE;
-
-        case DISPLAY_LIGHT:
-            return DISPLAY_HUMIDITY;
-
-        case DISPLAY_MOTION:
-        default:
-            return DISPLAY_LIGHT;
-    }
-}
-
-
-// ======================================================
-// SET DISPLAY MODE
-// ======================================================
-
-static void set_display_mode(
-    DisplayMode mode
-)
-{
-    if (
-        xSemaphoreTake(
-            display_mode_mutex,
-            portMAX_DELAY
-        ) == pdTRUE
-    )
-    {
-        current_display_mode = mode;
-
-        xSemaphoreGive(
-            display_mode_mutex
-        );
-    }
-}
-
-
-// ======================================================
-// APP MAIN
-// ======================================================
-
-void app_main(void)
+extern "C" void app_main()
 {
     ESP_LOGI(
         TAG,
@@ -232,14 +104,14 @@ void app_main(void)
     );
 
 
-    // ==================================================
-    // CONFIGURE ADC
-    // ==================================================
+    /* =====================================================
+     * CONFIGURE ADC
+     * ===================================================== */
 
-    adc_oneshot_unit_init_cfg_t adc_config =
-    {
-        .unit_id = ADC_UNIT_1,
-    };
+    adc_oneshot_unit_init_cfg_t adc_config = {};
+
+    adc_config.unit_id = ADC_UNIT_1;
+
 
     ESP_ERROR_CHECK(
         adc_oneshot_new_unit(
@@ -249,11 +121,11 @@ void app_main(void)
     );
 
 
-    adc_oneshot_chan_cfg_t channel_config =
-    {
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-        .atten = ADC_ATTEN_DB_12,
-    };
+    adc_oneshot_chan_cfg_t channel_config = {};
+
+    channel_config.atten = ADC_ATTEN_DB_12;
+    channel_config.bitwidth = ADC_BITWIDTH_DEFAULT;
+
 
     ESP_ERROR_CHECK(
         adc_oneshot_config_channel(
@@ -264,19 +136,26 @@ void app_main(void)
     );
 
 
-    // ==================================================
-    // CONFIGURE I2C
-    // ==================================================
+    ESP_LOGI(
+        TAG,
+        "ADC configured"
+    );
 
-    i2c_master_bus_config_t i2c_config =
-    {
-        .i2c_port = I2C_NUM_0,
-        .sda_io_num = I2C_SDA_GPIO,
-        .scl_io_num = I2C_SCL_GPIO,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
+
+    /* =====================================================
+     * CONFIGURE I2C BUS
+     * ===================================================== */
+
+    i2c_master_bus_config_t i2c_config = {};
+
+    i2c_config.i2c_port = I2C_NUM_0;
+    i2c_config.sda_io_num = I2C_SDA_GPIO;
+    i2c_config.scl_io_num = I2C_SCL_GPIO;
+    i2c_config.clk_source = I2C_CLK_SRC_DEFAULT;
+    i2c_config.glitch_ignore_cnt = 7;
+
+    i2c_config.flags.enable_internal_pullup = true;
+
 
     ESP_ERROR_CHECK(
         i2c_new_master_bus(
@@ -286,14 +165,72 @@ void app_main(void)
     );
 
 
-    // ==================================================
-    // CREATE SENSOR QUEUE
-    // ==================================================
+    ESP_LOGI(
+        TAG,
+        "I2C bus configured"
+    );
+
+
+    /* =====================================================
+     * INITIALIZE OLED
+     * ===================================================== */
+
+    ESP_ERROR_CHECK(
+        ssd1306_init(
+            i2c_bus_handle,
+            OLED_I2C_ADDRESS
+        )
+    );
+
+
+    ESP_LOGI(
+        TAG,
+        "OLED initialized"
+    );
+
+
+    /* =====================================================
+     * CONFIGURE ROTARY ENCODER
+     * ===================================================== */
+
+    gpio_config_t encoder_config = {};
+
+    encoder_config.pin_bit_mask =
+        (1ULL << ENCODER_CLK_GPIO) |
+        (1ULL << ENCODER_DT_GPIO) |
+        (1ULL << ENCODER_SW_GPIO);
+
+    encoder_config.mode = GPIO_MODE_INPUT;
+
+    encoder_config.pull_up_en = GPIO_PULLUP_ENABLE;
+
+    encoder_config.pull_down_en =
+        GPIO_PULLDOWN_DISABLE;
+
+    encoder_config.intr_type =
+        GPIO_INTR_DISABLE;
+
+
+    ESP_ERROR_CHECK(
+        gpio_config(&encoder_config)
+    );
+
+
+    ESP_LOGI(
+        TAG,
+        "Rotary encoder configured"
+    );
+
+
+    /* =====================================================
+     * CREATE SENSOR QUEUE
+     * ===================================================== */
 
     sensor_queue = xQueueCreate(
         10,
-        sizeof(struct SensorData)
+        sizeof(SensorData)
     );
+
 
     if (sensor_queue == NULL)
     {
@@ -306,57 +243,17 @@ void app_main(void)
     }
 
 
-    // ==================================================
-    // CREATE DISPLAY MODE MUTEX
-    // ==================================================
-
-    display_mode_mutex = xSemaphoreCreateMutex();
-
-    if (display_mode_mutex == NULL)
-    {
-        ESP_LOGE(
-            TAG,
-            "Failed to create display mode mutex"
-        );
-
-        return;
-    }
-
-
-    // ==================================================
-    // CONFIGURE ROTARY ENCODER GPIO
-    // ==================================================
-
-    gpio_config_t encoder_config =
-    {
-        .pin_bit_mask =
-            (1ULL << ENCODER_CLK_GPIO)
-            |
-            (1ULL << ENCODER_DT_GPIO)
-            |
-            (1ULL << ENCODER_SW_GPIO),
-
-        .mode = GPIO_MODE_INPUT,
-
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-
-        .intr_type = GPIO_INTR_DISABLE
-    };
-
-    ESP_ERROR_CHECK(
-        gpio_config(
-            &encoder_config
-        )
+    ESP_LOGI(
+        TAG,
+        "Sensor queue created"
     );
 
 
-    // ==================================================
-    // CREATE SENSOR TASK
-    // ==================================================
+    /* =====================================================
+     * START SENSOR TASK
+     * ===================================================== */
 
-    BaseType_t sensor_task_result =
+    BaseType_t sensor_result =
         xTaskCreate(
             sensor_task,
             "SensorTask",
@@ -366,7 +263,8 @@ void app_main(void)
             NULL
         );
 
-    if (sensor_task_result != pdPASS)
+
+    if (sensor_result != pdPASS)
     {
         ESP_LOGE(
             TAG,
@@ -377,46 +275,22 @@ void app_main(void)
     }
 
 
-    // ==================================================
-    // CREATE DISPLAY TASK
-    // ==================================================
+    /* =====================================================
+     * START INPUT TASK
+     * ===================================================== */
 
-    BaseType_t display_task_result =
-        xTaskCreate(
-            display_task,
-            "DisplayTask",
-            4096,
-            NULL,
-            4,
-            NULL
-        );
-
-    if (display_task_result != pdPASS)
-    {
-        ESP_LOGE(
-            TAG,
-            "Failed to create DisplayTask"
-        );
-
-        return;
-    }
-
-
-    // ==================================================
-    // CREATE INPUT TASK
-    // ==================================================
-
-    BaseType_t input_task_result =
+    BaseType_t input_result =
         xTaskCreate(
             input_task,
             "InputTask",
             4096,
             NULL,
-            4,
+            5,
             NULL
         );
 
-    if (input_task_result != pdPASS)
+
+    if (input_result != pdPASS)
     {
         ESP_LOGE(
             TAG,
@@ -427,16 +301,42 @@ void app_main(void)
     }
 
 
+    /* =====================================================
+     * START DISPLAY TASK
+     * ===================================================== */
+
+    BaseType_t display_result =
+        xTaskCreate(
+            display_task,
+            "DisplayTask",
+            4096,
+            NULL,
+            4,
+            NULL
+        );
+
+
+    if (display_result != pdPASS)
+    {
+        ESP_LOGE(
+            TAG,
+            "Failed to create DisplayTask"
+        );
+
+        return;
+    }
+
+
     ESP_LOGI(
         TAG,
-        "All FreeRTOS tasks created successfully"
+        "All tasks started"
     );
 }
 
 
-// ======================================================
-// SENSOR TASK
-// ======================================================
+/* =========================================================
+ * SENSOR TASK
+ * ========================================================= */
 
 static void sensor_task(void *pvParameters)
 {
@@ -451,20 +351,19 @@ static void sensor_task(void *pvParameters)
     int light_raw = 0;
 
 
-    struct SensorData sensor_data =
-    {
-        .temperature = 0.0f,
-        .humidity = 0.0f,
-        .lightLevel = 0,
-        .motionDetected = false
-    };
+    SensorData sensor_data = {};
+
+    sensor_data.temperature = 0.0f;
+    sensor_data.humidity = 0.0f;
+    sensor_data.lightLevel = 0;
+    sensor_data.motionDetected = false;
 
 
     while (1)
     {
-        // ==============================================
-        // READ DHT22
-        // ==============================================
+        /* =================================================
+         * READ DHT22
+         * ================================================= */
 
         esp_err_t dht_result =
             dht22_read(
@@ -484,17 +383,16 @@ static void sensor_task(void *pvParameters)
         }
         else
         {
-            ESP_LOGW(
-                "SensorTask",
-                "DHT22 read failed: %s",
+            printf(
+                "DHT22 read failed: %s\n",
                 esp_err_to_name(dht_result)
             );
         }
 
 
-        // ==============================================
-        // READ LDR
-        // ==============================================
+        /* =================================================
+         * READ LDR
+         * ================================================= */
 
         esp_err_t ldr_result =
             adc_oneshot_read(
@@ -511,65 +409,101 @@ static void sensor_task(void *pvParameters)
         }
         else
         {
-            ESP_LOGW(
-                "SensorTask",
-                "LDR read failed: %s",
+            printf(
+                "LDR read failed: %s\n",
                 esp_err_to_name(ldr_result)
             );
         }
 
 
-        // ==============================================
-        // MOTION
-        // ==============================================
+        /* =================================================
+         * MOTION
+         *
+         * Keep current implementation.
+         * ================================================= */
 
-        /*
-         * PIR will be implemented later.
-         */
         sensor_data.motionDetected = false;
 
 
-        // ==============================================
-        // SEND DATA TO QUEUE
-        // ==============================================
+        /* =================================================
+         * TEMPERATURE ALARM DECISION
+         * ================================================= */
+
+        AlarmState alarmState =
+            evaluateTemperature(
+                sensor_data.temperature
+            );
+
+
+        switch (alarmState)
+        {
+            case AlarmState::NORMAL:
+
+                printf(
+                    "Alarm: NORMAL\n"
+                );
+
+                break;
+
+
+            case AlarmState::LOW_TEMPERATURE:
+
+                printf(
+                    "Alarm: LOW TEMPERATURE\n"
+                );
+
+                break;
+
+
+            case AlarmState::HIGH_TEMPERATURE:
+
+                printf(
+                    "Alarm: HIGH TEMPERATURE\n"
+                );
+
+                break;
+        }
+
+
+        /* =================================================
+         * SEND DATA TO QUEUE
+         * ================================================= */
 
         if (
             xQueueSend(
                 sensor_queue,
                 &sensor_data,
-                pdMS_TO_TICKS(100)
+                0
             ) != pdPASS
         )
         {
-            ESP_LOGW(
-                "SensorTask",
-                "Sensor queue is full"
+            printf(
+                "Failed to send sensor data to queue\n"
             );
         }
 
 
-        // ==============================================
-        // SERIAL OUTPUT
-        // ==============================================
-
-        printf(
-            "\n-----------------------------\n"
-        );
+        /* =================================================
+         * PRINT SENSOR VALUES
+         * ================================================= */
 
         printf(
             "Temperature: %.2f C\n",
             sensor_data.temperature
         );
 
+
         printf(
             "Humidity: %.2f %%\n",
             sensor_data.humidity
         );
 
+
         printf(
             "Light: %d%%\n",
             sensor_data.lightLevel
         );
+
 
         printf(
             "Motion: %s\n",
@@ -578,14 +512,15 @@ static void sensor_task(void *pvParameters)
                 : "NO"
         );
 
+
         printf(
-            "-----------------------------\n"
+            "----------------------\n"
         );
 
 
-        // ==============================================
-        // PERIODIC EXECUTION
-        // ==============================================
+        /* =================================================
+         * WAIT 2 SECONDS
+         * ================================================= */
 
         vTaskDelayUntil(
             &lastWakeTime,
@@ -595,454 +530,430 @@ static void sensor_task(void *pvParameters)
 }
 
 
-// ======================================================
-// DISPLAY TASK
-// ======================================================
-
-static void display_task(void *pvParameters)
-{
-    struct SensorData received_data;
-
-    char value_text[32];
-
-
-    // ==================================================
-    // INITIALIZE OLED
-    // ==================================================
-
-    esp_err_t oled_result =
-        ssd1306_init(
-            i2c_bus_handle,
-            OLED_I2C_ADDRESS
-        );
-
-
-    if (oled_result != ESP_OK)
-    {
-        ESP_LOGE(
-            "DisplayTask",
-            "OLED initialization failed: %s",
-            esp_err_to_name(oled_result)
-        );
-
-        vTaskDelete(NULL);
-    }
-
-
-    ESP_LOGI(
-        "DisplayTask",
-        "OLED initialized successfully"
-    );
-
-
-    // ==================================================
-    // INITIAL OLED SCREEN
-    // ==================================================
-
-    ESP_ERROR_CHECK(
-        ssd1306_clear()
-    );
-
-    ESP_ERROR_CHECK(
-        ssd1306_set_cursor(
-            0,
-            0
-        )
-    );
-
-    ESP_ERROR_CHECK(
-        ssd1306_write_text(
-            "ROOM MONITOR"
-        )
-    );
-
-    ESP_ERROR_CHECK(
-        ssd1306_set_cursor(
-            0,
-            2
-        )
-    );
-
-    ESP_ERROR_CHECK(
-        ssd1306_write_text(
-            "TEMPERATURE"
-        )
-    );
-
-    ESP_ERROR_CHECK(
-        ssd1306_set_cursor(
-            0,
-            4
-        )
-    );
-
-    ESP_ERROR_CHECK(
-        ssd1306_write_text(
-            "WAITING..."
-        )
-    );
-
-    ESP_ERROR_CHECK(
-        ssd1306_update()
-    );
-
-
-    // ==================================================
-    // DISPLAY LOOP
-    // ==================================================
-
-    while (1)
-    {
-        /*
-         * Wait for new sensor data.
-         */
-        if (
-            xQueueReceive(
-                sensor_queue,
-                &received_data,
-                portMAX_DELAY
-            ) == pdTRUE
-        )
-        {
-            DisplayMode mode =
-                get_display_mode();
-
-
-            // ==========================================
-            // CLEAR DISPLAY
-            // ==========================================
-
-            ESP_ERROR_CHECK(
-                ssd1306_clear()
-            );
-
-
-            // ==========================================
-            // TITLE
-            // ==========================================
-
-            ESP_ERROR_CHECK(
-                ssd1306_set_cursor(
-                    0,
-                    0
-                )
-            );
-
-            ESP_ERROR_CHECK(
-                ssd1306_write_text(
-                    "ROOM MONITOR"
-                )
-            );
-
-
-            // ==========================================
-            // DISPLAY SELECTED PAGE
-            // ==========================================
-
-            switch (mode)
-            {
-                // --------------------------------------
-                // TEMPERATURE
-                // --------------------------------------
-
-                case DISPLAY_TEMPERATURE:
-
-                    ESP_ERROR_CHECK(
-                        ssd1306_set_cursor(
-                            0,
-                            2
-                        )
-                    );
-
-                    ESP_ERROR_CHECK(
-                        ssd1306_write_text(
-                            "TEMPERATURE"
-                        )
-                    );
-
-                    snprintf(
-                        value_text,
-                        sizeof(value_text),
-                        "%.1f C",
-                        received_data.temperature
-                    );
-
-                    ESP_ERROR_CHECK(
-                        ssd1306_set_cursor(
-                            0,
-                            4
-                        )
-                    );
-
-                    ESP_ERROR_CHECK(
-                        ssd1306_write_text(
-                            value_text
-                        )
-                    );
-
-                    break;
-
-
-                // --------------------------------------
-                // HUMIDITY
-                // --------------------------------------
-
-                case DISPLAY_HUMIDITY:
-
-                    ESP_ERROR_CHECK(
-                        ssd1306_set_cursor(
-                            0,
-                            2
-                        )
-                    );
-
-                    ESP_ERROR_CHECK(
-                        ssd1306_write_text(
-                            "HUMIDITY"
-                        )
-                    );
-
-                    snprintf(
-                        value_text,
-                        sizeof(value_text),
-                        "%.1f %%",
-                        received_data.humidity
-                    );
-
-                    ESP_ERROR_CHECK(
-                        ssd1306_set_cursor(
-                            0,
-                            4
-                        )
-                    );
-
-                    ESP_ERROR_CHECK(
-                        ssd1306_write_text(
-                            value_text
-                        )
-                    );
-
-                    break;
-
-
-                // --------------------------------------
-                // LIGHT
-                // --------------------------------------
-
-                case DISPLAY_LIGHT:
-
-                    ESP_ERROR_CHECK(
-                        ssd1306_set_cursor(
-                            0,
-                            2
-                        )
-                    );
-
-                    ESP_ERROR_CHECK(
-                        ssd1306_write_text(
-                            "LIGHT"
-                        )
-                    );
-
-                    snprintf(
-                        value_text,
-                        sizeof(value_text),
-                        "%d %%",
-                        received_data.lightLevel
-                    );
-
-                    ESP_ERROR_CHECK(
-                        ssd1306_set_cursor(
-                            0,
-                            4
-                        )
-                    );
-
-                    ESP_ERROR_CHECK(
-                        ssd1306_write_text(
-                            value_text
-                        )
-                    );
-
-                    break;
-
-
-                // --------------------------------------
-                // MOTION
-                // --------------------------------------
-
-                case DISPLAY_MOTION:
-
-                    ESP_ERROR_CHECK(
-                        ssd1306_set_cursor(
-                            0,
-                            2
-                        )
-                    );
-
-                    ESP_ERROR_CHECK(
-                        ssd1306_write_text(
-                            "MOTION"
-                        )
-                    );
-
-                    if (
-                        received_data.motionDetected
-                    )
-                    {
-                        ESP_ERROR_CHECK(
-                            ssd1306_set_cursor(
-                                0,
-                                4
-                            )
-                        );
-
-                        ESP_ERROR_CHECK(
-                            ssd1306_write_text(
-                                "DETECTED"
-                            )
-                        );
-                    }
-                    else
-                    {
-                        ESP_ERROR_CHECK(
-                            ssd1306_set_cursor(
-                                0,
-                                4
-                            )
-                        );
-
-                        ESP_ERROR_CHECK(
-                            ssd1306_write_text(
-                                "NO MOTION"
-                            )
-                        );
-                    }
-
-                    break;
-
-
-                default:
-
-                    break;
-            }
-
-
-            // ==========================================
-            // UPDATE OLED
-            // ==========================================
-
-            ESP_ERROR_CHECK(
-                ssd1306_update()
-            );
-        }
-    }
-}
-
-
-// ======================================================
-// INPUT TASK
-// ======================================================
+/* =========================================================
+ * INPUT TASK
+ * ========================================================= */
 
 static void input_task(void *pvParameters)
 {
-    int previous_clk =
+    int previousCLK =
         gpio_get_level(
             ENCODER_CLK_GPIO
         );
 
 
+    TickType_t lastRotationTime = 0;
+
+
     while (1)
     {
-        int current_clk =
+        int currentCLK =
             gpio_get_level(
                 ENCODER_CLK_GPIO
             );
 
 
-        /*
-         * Detect a falling edge on CLK.
-         *
-         * This corresponds to one encoder movement
-         * when using the standard Wokwi rotary encoder.
-         */
+        /* =================================================
+         * DETECT FALLING EDGE
+         * ================================================= */
+
         if (
-            current_clk != previous_clk
-            &&
-            current_clk == 0
+            previousCLK == 1 &&
+            currentCLK == 0
         )
         {
-            int dt_level =
-                gpio_get_level(
-                    ENCODER_DT_GPIO
-                );
+            TickType_t now =
+                xTaskGetTickCount();
 
 
-            DisplayMode current_mode =
-                get_display_mode();
+            /* =============================================
+             * DEBOUNCE
+             * ============================================= */
 
-
-            if (dt_level != current_clk)
-            {
-                // ======================================
-                // CLOCKWISE
-                // ======================================
-
-                DisplayMode new_mode =
-                    next_display_mode(
-                        current_mode
-                    );
-
-                set_display_mode(
-                    new_mode
-                );
-
-                ESP_LOGI(
-                    "InputTask",
-                    "Encoder clockwise -> mode %d",
-                    new_mode
-                );
-            }
-            else
-            {
-                // ======================================
-                // COUNTERCLOCKWISE
-                // ======================================
-
-                DisplayMode new_mode =
-                    previous_display_mode(
-                        current_mode
-                    );
-
-                set_display_mode(
-                    new_mode
-                );
-
-                ESP_LOGI(
-                    "InputTask",
-                    "Encoder counterclockwise -> mode %d",
-                    new_mode
-                );
-            }
-
-
-            /*
-             * Small debounce delay.
-             */
-            vTaskDelay(
+            if (
+                (now - lastRotationTime) >=
                 pdMS_TO_TICKS(50)
-            );
+            )
+            {
+                int dt =
+                    gpio_get_level(
+                        ENCODER_DT_GPIO
+                    );
+
+
+                /* =========================================
+                 * CLOCKWISE
+                 * ========================================= */
+
+                if (dt == 1)
+                {
+                    switch (currentMode)
+                    {
+                        case DisplayMode::TEMPERATURE:
+
+                            currentMode =
+                                DisplayMode::HUMIDITY;
+
+                            break;
+
+
+                        case DisplayMode::HUMIDITY:
+
+                            currentMode =
+                                DisplayMode::LIGHT;
+
+                            break;
+
+
+                        case DisplayMode::LIGHT:
+
+                            currentMode =
+                                DisplayMode::MOTION;
+
+                            break;
+
+
+                        case DisplayMode::MOTION:
+
+                            currentMode =
+                                DisplayMode::TEMPERATURE;
+
+                            break;
+                    }
+
+
+                    printf(
+                        "Encoder: CLOCKWISE -> %s\n",
+                        displayModeName(
+                            currentMode
+                        )
+                    );
+                }
+
+
+                /* =========================================
+                 * COUNTERCLOCKWISE
+                 * ========================================= */
+
+                else
+                {
+                    switch (currentMode)
+                    {
+                        case DisplayMode::TEMPERATURE:
+
+                            currentMode =
+                                DisplayMode::MOTION;
+
+                            break;
+
+
+                        case DisplayMode::HUMIDITY:
+
+                            currentMode =
+                                DisplayMode::TEMPERATURE;
+
+                            break;
+
+
+                        case DisplayMode::LIGHT:
+
+                            currentMode =
+                                DisplayMode::HUMIDITY;
+
+                            break;
+
+
+                        case DisplayMode::MOTION:
+
+                            currentMode =
+                                DisplayMode::LIGHT;
+
+                            break;
+                    }
+
+
+                    printf(
+                        "Encoder: COUNTERCLOCKWISE -> %s\n",
+                        displayModeName(
+                            currentMode
+                        )
+                    );
+                }
+
+
+                lastRotationTime = now;
+            }
         }
 
 
-        previous_clk = current_clk;
+        previousCLK = currentCLK;
 
 
-        /*
-         * Poll encoder approximately every 5 ms.
-         */
         vTaskDelay(
             pdMS_TO_TICKS(5)
         );
+    }
+}
+
+
+/* =========================================================
+ * DISPLAY TASK
+ * ========================================================= */
+
+static void display_task(void *pvParameters)
+{
+    SensorData sensor_data = {};
+
+    sensor_data.temperature = 0.0f;
+    sensor_data.humidity = 0.0f;
+    sensor_data.lightLevel = 0;
+    sensor_data.motionDetected = false;
+
+
+    while (1)
+    {
+        if (
+            xQueueReceive(
+                sensor_queue,
+                &sensor_data,
+                pdMS_TO_TICKS(2500)
+            ) == pdPASS
+        )
+        {
+            char line2[32];
+            char line3[32];
+
+
+            /* =============================================
+             * CLEAR OLED
+             * ============================================= */
+
+            ssd1306_clear();
+
+
+            /* =============================================
+             * HEADER
+             * ============================================= */
+
+            ssd1306_set_cursor(
+                0,
+                0
+            );
+
+            ssd1306_write_text(
+                "ROOM MONITOR"
+            );
+
+
+            /* =============================================
+             * DISPLAY CURRENT PAGE
+             * ============================================= */
+
+            switch (currentMode)
+            {
+                case DisplayMode::TEMPERATURE:
+
+                    snprintf(
+                        line2,
+                        sizeof(line2),
+                        "TEMPERATURE"
+                    );
+
+
+                    snprintf(
+                        line3,
+                        sizeof(line3),
+                        "%.1f C",
+                        sensor_data.temperature
+                    );
+
+
+                    ssd1306_set_cursor(
+                        0,
+                        2
+                    );
+
+                    ssd1306_write_text(
+                        line2
+                    );
+
+
+                    ssd1306_set_cursor(
+                        0,
+                        4
+                    );
+
+                    ssd1306_write_text(
+                        line3
+                    );
+
+                    break;
+
+
+                case DisplayMode::HUMIDITY:
+
+                    snprintf(
+                        line2,
+                        sizeof(line2),
+                        "HUMIDITY"
+                    );
+
+
+                    snprintf(
+                        line3,
+                        sizeof(line3),
+                        "%.1f",
+                        sensor_data.humidity
+                    );
+
+
+                    ssd1306_set_cursor(
+                        0,
+                        2
+                    );
+
+                    ssd1306_write_text(
+                        line2
+                    );
+
+
+                    ssd1306_set_cursor(
+                        0,
+                        4
+                    );
+
+                    ssd1306_write_text(
+                        line3
+                    );
+
+                    break;
+
+
+                case DisplayMode::LIGHT:
+
+                    snprintf(
+                        line2,
+                        sizeof(line2),
+                        "LIGHT"
+                    );
+
+
+                    snprintf(
+                        line3,
+                        sizeof(line3),
+                        "%d%%",
+                        sensor_data.lightLevel
+                    );
+
+
+                    ssd1306_set_cursor(
+                        0,
+                        2
+                    );
+
+                    ssd1306_write_text(
+                        line2
+                    );
+
+
+                    ssd1306_set_cursor(
+                        0,
+                        4
+                    );
+
+                    ssd1306_write_text(
+                        line3
+                    );
+
+                    break;
+
+
+                case DisplayMode::MOTION:
+
+                    snprintf(
+                        line2,
+                        sizeof(line2),
+                        "MOTION"
+                    );
+
+
+                    snprintf(
+                        line3,
+                        sizeof(line3),
+                        "%s",
+                        sensor_data.motionDetected
+                            ? "DETECTED"
+                            : "NO MOTION"
+                    );
+
+
+                    ssd1306_set_cursor(
+                        0,
+                        2
+                    );
+
+                    ssd1306_write_text(
+                        line2
+                    );
+
+
+                    ssd1306_set_cursor(
+                        0,
+                        4
+                    );
+
+                    ssd1306_write_text(
+                        line3
+                    );
+
+                    break;
+            }
+
+
+            /* =============================================
+             * SEND BUFFER TO OLED
+             * ============================================= */
+
+            esp_err_t result =
+                ssd1306_update();
+
+
+            if (result != ESP_OK)
+            {
+                ESP_LOGE(
+                    TAG,
+                    "OLED update failed: %s",
+                    esp_err_to_name(result)
+                );
+            }
+        }
+    }
+}
+
+
+/* =========================================================
+ * DISPLAY MODE NAME
+ * ========================================================= */
+
+static const char *displayModeName(
+    DisplayMode mode
+)
+{
+    switch (mode)
+    {
+        case DisplayMode::TEMPERATURE:
+            return "TEMPERATURE";
+
+        case DisplayMode::HUMIDITY:
+            return "HUMIDITY";
+
+        case DisplayMode::LIGHT:
+            return "LIGHT";
+
+        case DisplayMode::MOTION:
+            return "MOTION";
+
+        default:
+            return "UNKNOWN";
     }
 }
