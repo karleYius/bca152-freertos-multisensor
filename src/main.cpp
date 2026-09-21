@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdarg.h>
 
 #include "esp_log.h"
 #include "esp_err.h"
@@ -22,34 +23,34 @@
  * GPIO / HARDWARE CONFIGURATION
  * ========================================================= */
 
-#define DHT22_GPIO              GPIO_NUM_4
+#define DHT22_GPIO               GPIO_NUM_4
 
-#define LDR_CHANNEL             ADC_CHANNEL_6
-#define LDR_GPIO                GPIO_NUM_34
+#define LDR_CHANNEL              ADC_CHANNEL_6
+#define LDR_GPIO                 GPIO_NUM_34
 
-#define I2C_SDA_GPIO            GPIO_NUM_21
-#define I2C_SCL_GPIO            GPIO_NUM_22
-#define OLED_I2C_ADDRESS        0x3C
+#define I2C_SDA_GPIO             GPIO_NUM_21
+#define I2C_SCL_GPIO             GPIO_NUM_22
+#define OLED_I2C_ADDRESS         0x3C
 
 /* Rotary Encoder */
-#define ENCODER_CLK_GPIO        GPIO_NUM_18
-#define ENCODER_DT_GPIO         GPIO_NUM_19
-#define ENCODER_SW_GPIO         GPIO_NUM_23
+#define ENCODER_CLK_GPIO         GPIO_NUM_18
+#define ENCODER_DT_GPIO          GPIO_NUM_19
+#define ENCODER_SW_GPIO          GPIO_NUM_23
 
 /* PIR Motion Sensor */
-#define PIR_GPIO                GPIO_NUM_27
+#define PIR_GPIO                 GPIO_NUM_27
 
 
 /* =========================================================
  * TIMING
  * ========================================================= */
 
-#define SENSOR_INTERVAL_MS      2000
+#define SENSOR_INTERVAL_MS       2000
 #define MOTION_CHECK_INTERVAL_MS 100
 #define ENCODER_CHECK_INTERVAL_MS 5
 
 /* Laboratory testing timeout */
-#define INACTIVITY_TIMEOUT_MS   15000
+#define INACTIVITY_TIMEOUT_MS    15000
 
 
 /* =========================================================
@@ -119,6 +120,9 @@ static EventGroupHandle_t system_event_group = NULL;
 /* Mutex for shared state */
 static SemaphoreHandle_t state_mutex = NULL;
 
+/* PART XI Mutex for shared Serial output */
+static SemaphoreHandle_t serialMutex = NULL;
+
 /* Current OLED page */
 static DisplayMode currentMode =
     DisplayMode::TEMPERATURE;
@@ -142,6 +146,11 @@ static void input_task(void *pvParameters);
 static void display_task(void *pvParameters);
 
 static void motion_task(void *pvParameters);
+
+static void serial_printf(
+    const char *format,
+    ...
+);
 
 static const char *displayModeName(
     DisplayMode mode
@@ -393,6 +402,7 @@ extern "C" void app_main()
      *
      * EVENT_ACTIVE is therefore SET.
      */
+
     xEventGroupSetBits(
         system_event_group,
         EVENT_ACTIVE
@@ -427,6 +437,42 @@ extern "C" void app_main()
     ESP_LOGI(
         TAG,
         "State mutex created"
+    );
+
+
+    /* =====================================================
+     * CREATE SERIAL MUTEX
+     *
+     * PART XI — MUTEX
+     *
+     * Shared resource:
+     *     ESP32 Serial output
+     *
+     * Competing tasks:
+     *     SensorTask
+     *     MotionTask
+     *     InputTask
+     *     DisplayTask
+     * ===================================================== */
+
+    serialMutex =
+        xSemaphoreCreateMutex();
+
+
+    if (serialMutex == NULL)
+    {
+        ESP_LOGE(
+            TAG,
+            "Failed to create serial mutex"
+        );
+
+        return;
+    }
+
+
+    ESP_LOGI(
+        TAG,
+        "Serial mutex created"
     );
 
 
@@ -603,7 +649,7 @@ static void sensor_task(
         }
         else
         {
-            printf(
+            serial_printf(
                 "DHT22 read failed: %s\n",
                 esp_err_to_name(
                     dht_result
@@ -630,12 +676,13 @@ static void sensor_task(
              * Convert raw ADC value to
              * approximate percentage.
              */
+
             sensor_data.lightLevel =
                 (light_raw * 100) / 4095;
         }
         else
         {
-            printf(
+            serial_printf(
                 "LDR read failed: %s\n",
                 esp_err_to_name(
                     ldr_result
@@ -707,7 +754,7 @@ static void sensor_task(
         {
             case AlarmState::NORMAL:
 
-                printf(
+                serial_printf(
                     "Alarm: NORMAL\n"
                 );
 
@@ -716,7 +763,7 @@ static void sensor_task(
 
             case AlarmState::LOW_TEMPERATURE:
 
-                printf(
+                serial_printf(
                     "Alarm: LOW TEMPERATURE\n"
                 );
 
@@ -725,7 +772,7 @@ static void sensor_task(
 
             case AlarmState::HIGH_TEMPERATURE:
 
-                printf(
+                serial_printf(
                     "Alarm: HIGH TEMPERATURE\n"
                 );
 
@@ -745,7 +792,7 @@ static void sensor_task(
             ) != pdPASS
         )
         {
-            printf(
+            serial_printf(
                 "Failed to send sensor data to queue\n"
             );
         }
@@ -755,25 +802,25 @@ static void sensor_task(
          * SERIAL OUTPUT
          * ================================================= */
 
-        printf(
+        serial_printf(
             "Temperature: %.2f C\n",
             sensor_data.temperature
         );
 
 
-        printf(
+        serial_printf(
             "Humidity: %.2f %%\n",
             sensor_data.humidity
         );
 
 
-        printf(
+        serial_printf(
             "Light: %d%%\n",
             sensor_data.lightLevel
         );
 
 
-        printf(
+        serial_printf(
             "Motion: %s\n",
             sensor_data.motionDetected
                 ? "YES"
@@ -791,7 +838,7 @@ static void sensor_task(
             );
 
 
-        printf(
+        serial_printf(
             "Events: ACTIVE=%s MOTION=%s ALARM=%s\n",
             (eventBits & EVENT_ACTIVE)
                 ? "SET"
@@ -807,7 +854,7 @@ static void sensor_task(
         );
 
 
-        printf(
+        serial_printf(
             "----------------------\n"
         );
 
@@ -926,19 +973,20 @@ static void motion_task(
                  * EVENT_ACTIVE represents the
                  * current system state.
                  */
+
                 xEventGroupSetBits(
                     system_event_group,
                     EVENT_ACTIVE
                 );
 
 
-                printf(
+                serial_printf(
                     "STATE: INACTIVE -> ACTIVE "
                     "(motion detected)\n"
                 );
 
 
-                printf(
+                serial_printf(
                     "DISPLAY: ON "
                     "(system active)\n"
                 );
@@ -1006,19 +1054,20 @@ static void motion_task(
                 /*
                  * Clear ACTIVE event bit.
                  */
+
                 xEventGroupClearBits(
                     system_event_group,
                     EVENT_ACTIVE
                 );
 
 
-                printf(
+                serial_printf(
                     "STATE: ACTIVE -> INACTIVE "
                     "(15s inactivity)\n"
                 );
 
 
-                printf(
+                serial_printf(
                     "DISPLAY: OFF "
                     "(system inactive)\n"
                 );
@@ -1150,6 +1199,9 @@ static void input_task(
 
                 if (dt == 1)
                 {
+                    const char *modeName = "UNKNOWN";
+
+
                     if (
                         xSemaphoreTake(
                             state_mutex,
@@ -1192,18 +1244,22 @@ static void input_task(
                         }
 
 
-                        printf(
-                            "Encoder: CLOCKWISE -> %s\n",
+                        modeName =
                             displayModeName(
                                 currentMode
-                            )
-                        );
+                            );
 
 
                         xSemaphoreGive(
                             state_mutex
                         );
                     }
+
+
+                    serial_printf(
+                        "Encoder: CLOCKWISE -> %s\n",
+                        modeName
+                    );
                 }
 
 
@@ -1213,6 +1269,9 @@ static void input_task(
 
                 else
                 {
+                    const char *modeName = "UNKNOWN";
+
+
                     if (
                         xSemaphoreTake(
                             state_mutex,
@@ -1255,18 +1314,22 @@ static void input_task(
                         }
 
 
-                        printf(
-                            "Encoder: COUNTERCLOCKWISE -> %s\n",
+                        modeName =
                             displayModeName(
                                 currentMode
-                            )
-                        );
+                            );
 
 
                         xSemaphoreGive(
                             state_mutex
                         );
                     }
+
+
+                    serial_printf(
+                        "Encoder: COUNTERCLOCKWISE -> %s\n",
+                        modeName
+                    );
                 }
 
 
@@ -1348,6 +1411,7 @@ static void display_task(
                  * Clear the OLED once when entering
                  * INACTIVE.
                  */
+
                 ssd1306_clear();
 
                 ssd1306_update();
@@ -1355,7 +1419,7 @@ static void display_task(
                 displayWasActive = false;
 
 
-                printf(
+                serial_printf(
                     "DISPLAY: OFF "
                     "(system inactive)\n"
                 );
@@ -1378,7 +1442,8 @@ static void display_task(
         {
             displayWasActive = true;
 
-            printf(
+
+            serial_printf(
                 "DISPLAY: ON "
                 "(system active)\n"
             );
@@ -1431,7 +1496,7 @@ static void display_task(
                 eventBits & EVENT_MOTION
             )
             {
-                printf(
+                serial_printf(
                     "EVENT: MOTION DETECTED\n"
                 );
 
@@ -1462,13 +1527,13 @@ static void display_task(
             {
                 if (alarmEvent)
                 {
-                    printf(
+                    serial_printf(
                         "EVENT: ALARM ACTIVE\n"
                     );
                 }
                 else
                 {
-                    printf(
+                    serial_printf(
                         "EVENT: ALARM CLEARED\n"
                     );
                 }
@@ -1494,6 +1559,7 @@ static void display_task(
                 0,
                 0
             );
+
 
             ssd1306_write_text(
                 "ROOM MONITOR"
@@ -1536,6 +1602,7 @@ static void display_task(
                         2
                     );
 
+
                     ssd1306_write_text(
                         line2
                     );
@@ -1545,6 +1612,7 @@ static void display_task(
                         0,
                         4
                     );
+
 
                     ssd1306_write_text(
                         line3
@@ -1579,6 +1647,7 @@ static void display_task(
                         2
                     );
 
+
                     ssd1306_write_text(
                         line2
                     );
@@ -1588,6 +1657,7 @@ static void display_task(
                         0,
                         4
                     );
+
 
                     ssd1306_write_text(
                         line3
@@ -1622,6 +1692,7 @@ static void display_task(
                         2
                     );
 
+
                     ssd1306_write_text(
                         line2
                     );
@@ -1631,6 +1702,7 @@ static void display_task(
                         0,
                         4
                     );
+
 
                     ssd1306_write_text(
                         line3
@@ -1667,6 +1739,7 @@ static void display_task(
                         2
                     );
 
+
                     ssd1306_write_text(
                         line2
                     );
@@ -1676,6 +1749,7 @@ static void display_task(
                         0,
                         4
                     );
+
 
                     ssd1306_write_text(
                         line3
@@ -1710,6 +1784,7 @@ static void display_task(
              * EVENT_ACTIVE is a meaningful consumed/observed
              * system-state signal.
              */
+
             (void)activeEvent;
         }
     }
@@ -1772,5 +1847,70 @@ static const char *displayModeName(
 
         default:
             return "UNKNOWN";
+    }
+}
+
+
+/* =========================================================
+ * PART XI — SERIAL MUTEX
+ *
+ * Shared resource:
+ *     ESP32 Serial output
+ *
+ * Competing tasks:
+ *     SensorTask
+ *     MotionTask
+ *     InputTask
+ *     DisplayTask
+ *
+ * Failure prevented:
+ *     Multiple tasks could write diagnostic messages
+ *     at nearly the same time, causing output to become
+ *     interleaved and difficult to read.
+ *
+ * The mutex ensures that one task completes its serial
+ * output operation before another task accesses the
+ * shared serial resource.
+ * ========================================================= */
+
+static void serial_printf(
+    const char *format,
+    ...
+)
+{
+    if (serialMutex != NULL)
+    {
+        xSemaphoreTake(
+            serialMutex,
+            portMAX_DELAY
+        );
+    }
+
+
+    va_list args;
+
+
+    va_start(
+        args,
+        format
+    );
+
+
+    vprintf(
+        format,
+        args
+    );
+
+
+    va_end(
+        args
+    );
+
+
+    if (serialMutex != NULL)
+    {
+        xSemaphoreGive(
+            serialMutex
+        );
     }
 }
